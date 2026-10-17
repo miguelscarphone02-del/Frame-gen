@@ -71,6 +71,7 @@ class FrameGenEngine(
     // Programas
     private var pOes: Prog? = null
     private var pDown: Prog? = null
+    private var pDownR: Prog? = null
     private var pCoarse: Prog? = null
     private var pRefine: Prog? = null
     private var pMid: Prog? = null
@@ -194,9 +195,9 @@ class FrameGenEngine(
                 st?.release()
                 st = null
                 releaseTargets()
-                pOes?.delete(); pDown?.delete(); pCoarse?.delete()
+                pOes?.delete(); pDown?.delete(); pDownR?.delete(); pCoarse?.delete()
                 pRefine?.delete(); pMid?.delete(); pPresent?.delete()
-                pOes = null; pDown = null; pCoarse = null
+                pOes = null; pDown = null; pDownR = null; pCoarse = null
                 pRefine = null; pMid = null; pPresent = null
                 if (oesTex != 0) GLES20.glDeleteTextures(1, intArrayOf(oesTex), 0)
                 oesTex = 0
@@ -294,6 +295,7 @@ class FrameGenEngine(
     private fun initPrograms() {
         pOes = Prog(Shaders.VERT, Shaders.FRAG_OES)
         pDown = Prog(Shaders.VERT, Shaders.FRAG_DOWN)
+        pDownR = Prog(Shaders.VERT, Shaders.FRAG_DOWN_R)
         pCoarse = Prog(Shaders.VERT, Shaders.fragCoarse(cfg.radius))
         pRefine = Prog(Shaders.VERT, Shaders.fragRefine())
         pMid = Prog(Shaders.VERT, Shaders.FRAG_MID)
@@ -307,8 +309,9 @@ class FrameGenEngine(
         val w2 = (capW + 7) / 8
         val h2 = (capH + 7) / 8
         frames = arrayOf(GlUtil.createTarget(capW, capH), GlUtil.createTarget(capW, capH))
-        l1 = arrayOf(GlUtil.createTarget(w1, h1), GlUtil.createTarget(w1, h1))
-        l2 = arrayOf(GlUtil.createTarget(w2, h2), GlUtil.createTarget(w2, h2))
+        // Luminancia em 1 canal (R8): 4x menos memoria lida na busca de movimento.
+        l1 = arrayOf(GlUtil.createTarget(w1, h1, true), GlUtil.createTarget(w1, h1, true))
+        l2 = arrayOf(GlUtil.createTarget(w2, h2, true), GlUtil.createTarget(w2, h2, true))
         coarse = GlUtil.createTarget(w2, h2)
         fine = GlUtil.createTarget(w2, h2)
         mid = GlUtil.createTarget(capW, capH)
@@ -418,20 +421,25 @@ class FrameGenEngine(
 
     private fun buildPyramid(i: Int) {
         val p = pDown ?: return
+        val pr = pDownR ?: return
         val f = frames ?: return
         val a = l1 ?: return
         val b = l2 ?: return
+
+        // Quadro RGBA -> L1 (luma, R8)
         p.use()
         p.i1("uSrc", 0)
-
         GlUtil.bindTarget(a[i])
         GlUtil.bindTex2D(0, f[i].tex)
         p.f2("uOff", 1f / f[i].w, 1f / f[i].h)
         GlUtil.drawQuad()
 
+        // L1 (R8) -> L2 (R8)
+        pr.use()
+        pr.i1("uSrc", 0)
         GlUtil.bindTarget(b[i])
         GlUtil.bindTex2D(0, a[i].tex)
-        p.f2("uOff", 0.5f / a[i].w, 0.5f / a[i].h)
+        pr.f2("uOff", 0.5f / a[i].w, 0.5f / a[i].h)
         GlUtil.drawQuad()
     }
 
