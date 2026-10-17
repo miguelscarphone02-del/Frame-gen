@@ -15,11 +15,6 @@ import android.os.IBinder
 import android.os.Looper
 import android.widget.Toast
 
-/**
- * Servico em primeiro plano (obrigatorio para MediaProjection).
- * Recebe o resultado da permissao de captura e entrega o MediaProjection
- * para o overlay/engine.
- */
 class ProjectionService : Service() {
 
     companion object {
@@ -38,15 +33,14 @@ class ProjectionService : Service() {
             main.post { stopSelf() }
         }
 
-        // Android 14: o app capturado saiu / voltou para a tela.
         override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
             Bus.overlay?.setCaptureVisible(isVisible)
         }
 
-                override fun onCapturedContentResize(width: Int, height: Int) {
+        override fun onCapturedContentResize(width: Int, height: Int) {
             Bus.overlay?.onCaptureResize(width, height)
         }
-    
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
