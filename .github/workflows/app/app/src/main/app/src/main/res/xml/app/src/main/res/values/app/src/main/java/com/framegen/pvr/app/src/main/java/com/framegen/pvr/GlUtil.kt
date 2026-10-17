@@ -4,7 +4,7 @@ import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLES30
 
-/** Textura RGBA8 + FBO. */
+/** Textura (RGBA8 ou R8) + FBO. */
 class Target(val tex: Int, val fbo: Int, val w: Int, val h: Int) {
     fun release() {
         GLES20.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
@@ -79,14 +79,22 @@ object GlUtil {
         return t[0]
     }
 
-    fun createTarget(w: Int, h: Int): Target {
+    /** singleChannel = true cria textura R8 (so luminancia, 1 byte por pixel). */
+    fun createTarget(w: Int, h: Int, singleChannel: Boolean = false): Target {
         val t = IntArray(1)
         GLES20.glGenTextures(1, t, 0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, t[0])
-        GLES20.glTexImage2D(
-            GLES20.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, w, h, 0,
-            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null
-        )
+        if (singleChannel) {
+            GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D, 0, GLES30.GL_R8, w, h, 0,
+                GLES30.GL_RED, GLES20.GL_UNSIGNED_BYTE, null
+            )
+        } else {
+            GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, w, h, 0,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null
+            )
+        }
         setupParams(GLES20.GL_TEXTURE_2D)
 
         val f = IntArray(1)
