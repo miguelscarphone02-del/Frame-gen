@@ -4,7 +4,7 @@ package com.framegen.pvr
  * Pipeline (OpenGL ES 3.0), por quadro capturado:
  *   OES -> RGBA (frame) -> luma L1 (1/4) -> L2 (1/8) -> L3 (1/16)   [L1..L3 em R8]
  *   busca grossa em L3 (+-R) -> refino em L2 (+-1) -> refino em L1 (+-1)
- *   -> mapa de movimento em 1/4 da resolucao
+ *   -> filtro mediano 3x3 -> refino sub-pixel (meio texel) -> mapa final (1/4)
  *   interpolacao: quadro do meio entre anterior e atual
  *   extrapolacao: quadro atual avancado meio passo (baixa latencia)
  *
@@ -170,9 +170,102 @@ void main() {
         return sb.toString()
     }
 
+    /** Filtro mediano 3x3 do mapa de movimento (remove vetores soltos). */
+    const val FRAG_MEDIAN = """#version 300 es
+precision mediump float;
+precision highp sampler2D;
+uniform highp sampler2D uFlow;
+out vec4 o;
+
+#define s2(a, b) temp = a; a = min(a, b); b = max(temp, b);
+#define mn3(a, b, c) s2(a, b); s2(a, c);
+#define mx3(a, b, c) s2(b, c); s2(a, c);
+#define mnmx3(a, b, c) mx3(a, b, c); s2(a, b);
+#define mnmx4(a, b, c, d) s2(a, b); s2(c, d); s2(a, c); s2(b, d);
+#define mnmx5(a, b, c, d, e) s2(a, b); s2(c, d); mn3(a, c, e); mx3(b, d, e);
+#define mnmx6(a, b, c, d, e, f) s2(a, d); s2(b, e); s2(c, f); mn3(a, b, c); mx3(d, e, f);
+
+vec3 fetchF(ivec2 p, ivec2 hi) {
+    return texelFetch(uFlow, clamp(p, ivec2(0), hi), 0).rgb;
+}
+
+void main() {
+    ivec2 hi = textureSize(uFlow, 0) - 1;
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec3 v0 = fetchF(p + ivec2(-1, -1), hi);
+    vec3 v1 = fetchF(p + ivec2( 0, -1), hi);
+    vec3 v2 = fetchF(p + ivec2( 1, -1), hi);
+    vec3 v3 = fetchF(p + ivec2(-1,  0), hi);
+    vec3 v4 = fetchF(p + ivec2( 0,  0), hi);
+    vec3 v5 = fetchF(p + ivec2( 1,  0), hi);
+    vec3 v6 = fetchF(p + ivec2(-1,  1), hi);
+    vec3 v7 = fetchF(p + ivec2( 0,  1), hi);
+    vec3 v8 = fetchF(p + ivec2( 1,  1), hi);
+    vec3 temp;
+    mnmx6(v0, v1, v2, v3, v4, v5);
+    mnmx5(v1, v2, v3, v4, v6);
+    mnmx4(v2, v3, v4, v7);
+    mnmx3(v3, v4, v8);
+    o = vec4(v4, 1.0);
+}
+"""
+
+    /**
+     * Refino sub-pixel em L1: testa +-0.5 texel em volta do vetor (ja filtrado)
+     * e recalcula o custo com o vetor final.
+     */
+    fun fragSubpixel(): String {
+        val win = ArrayList<Pair<Int, Int>>()
+        for (j in -1..1) for (i in -1..1) win.add(i to j)
+        val sb = StringBuilder()
+        sb.append(
+            """#version 300 es
+precision mediump float;
+precision mediump sampler2D;
+uniform sampler2D uCur;
+uniform sampler2D uPrev;
+uniform highp sampler2D uFlow;
+uniform highp vec2 uTexel;
+uniform float uLambda;
+in highp vec2 vUv;
+out vec4 o;
+void main() {
+  vec4 fv = texelFetch(uFlow, ivec2(gl_FragCoord.xy), 0);
+  highp vec2 base = (fv.rg - 0.5) * 64.0;
+"""
+        )
+        win.forEachIndexed { k, (i, j) ->
+            sb.append("  float a$k = texture(uCur, vUv + vec2(${i}.0, ${j}.0) * uTexel).r;\n")
+        }
+        sb.append(
+            """  float best = 1000.0;
+  highp vec2 bv = base;
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      vec2 d = vec2(float(dx), float(dy)) * 0.5;
+      highp vec2 p = vUv + (base + d) * uTexel;
+      float sad = 0.0;
+"""
+        )
+        win.forEachIndexed { k, (i, j) ->
+            sb.append("      sad += abs(a$k - texture(uPrev, p + vec2(${i}.0, ${j}.0) * uTexel).r);\n")
+        }
+        sb.append(
+            """      sad += uLambda * length(d);
+      if (sad < best) { best = sad; bv = base + d; }
+    }
+  }
+  o = vec4(bv / 64.0 + 0.5, best / 9.0, 1.0);
+}
+"""
+        )
+        return sb.toString()
+    }
+
     /**
      * Interpolacao (t = 0.5): mistura atual deslocado e anterior deslocado.
-     * Onde os dois discordam ou o custo do movimento e alto, usa o quadro atual.
+     * Usa o quadro atual sem deslocar onde: os dois discordam, o custo do
+     * movimento e alto, ou o pixel nao mudou entre os quadros (HUD/parado).
      */
     const val FRAG_MID = """#version 300 es
 precision highp float;
@@ -182,6 +275,7 @@ uniform sampler2D uPrev;
 uniform sampler2D uFlow;
 uniform vec2 uInvL1;
 uniform vec2 uErr;
+uniform vec2 uCost;
 in vec2 vUv;
 out vec4 o;
 void main() {
@@ -190,8 +284,10 @@ void main() {
     vec3 a = texture(uCur,  vUv - 0.5 * off).rgb;
     vec3 b = texture(uPrev, vUv + 0.5 * off).rgb;
     vec3 c0 = texture(uCur, vUv).rgb;
+    vec3 p0 = texture(uPrev, vUv).rgb;
     float err = dot(abs(a - b), vec3(0.3333));
-    float w = max(smoothstep(uErr.x, uErr.y, err), smoothstep(0.10, 0.25, fl.b));
+    float still = 1.0 - smoothstep(0.004, 0.03, dot(abs(c0 - p0), vec3(0.3333)));
+    float w = max(max(smoothstep(uErr.x, uErr.y, err), smoothstep(uCost.x, uCost.y, fl.b)), still);
     o = vec4(mix(0.5 * (a + b), c0, w), 1.0);
 }
 """
@@ -208,17 +304,20 @@ uniform sampler2D uPrev;
 uniform sampler2D uFlow;
 uniform vec2 uInvL1;
 uniform vec2 uErr;
+uniform vec2 uCost;
 in vec2 vUv;
 out vec4 o;
 void main() {
     vec3 fl = texture(uFlow, vUv).rgb;
     vec2 off = (fl.rg - 0.5) * 64.0 * uInvL1;
     vec3 c0 = texture(uCur, vUv).rgb;
+    vec3 p0 = texture(uPrev, vUv).rgb;
     vec2 q = vUv + 0.5 * off;
     vec3 e = texture(uCur, q).rgb;
     vec3 p = texture(uPrev, q + off).rgb;
     float err = dot(abs(e - p), vec3(0.3333));
-    float w = max(smoothstep(uErr.x, uErr.y, err), smoothstep(0.10, 0.25, fl.b));
+    float still = 1.0 - smoothstep(0.004, 0.03, dot(abs(c0 - p0), vec3(0.3333)));
+    float w = max(max(smoothstep(uErr.x, uErr.y, err), smoothstep(uCost.x, uCost.y, fl.b)), still);
     o = vec4(mix(e, c0, w), 1.0);
 }
 """
