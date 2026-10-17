@@ -83,6 +83,23 @@ class MainActivity : Activity() {
             })
         })
 
+        val protLabel = text("Protecao contra distorcao: ${Prefs.getProtect(this)}%")
+        col.addView(protLabel)
+        col.addView(SeekBar(this).apply {
+            max = 100
+            progress = Prefs.getProtect(this@MainActivity)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    protLabel.text = "Protecao contra distorcao: $p%"
+                    Prefs.setProtect(this@MainActivity, p)
+                }
+
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        })
+        col.addView(text("Mais alto = menos distorcao, mas mais quadros repetidos nas areas duvidosas."))
+
         col.addView(check("Interpolacao ligada", Prefs.getInterpolate(this)) { Prefs.setInterpolate(this, it) })
         col.addView(
             check(
