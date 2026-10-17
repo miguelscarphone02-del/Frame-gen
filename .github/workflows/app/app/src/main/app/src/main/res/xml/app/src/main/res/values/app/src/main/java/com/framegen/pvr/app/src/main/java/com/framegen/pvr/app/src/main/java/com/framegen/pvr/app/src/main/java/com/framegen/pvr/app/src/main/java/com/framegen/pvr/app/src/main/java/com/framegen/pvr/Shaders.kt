@@ -4,14 +4,16 @@ package com.framegen.pvr
  * Todos os shaders do pipeline (OpenGL ES 3.0).
  *
  * Pipeline por quadro capturado:
- *   OES -> RGBA (frame)  ->  luma 1/4 (L1)  ->  luma 1/8 (L2)
+ *   OES -> RGBA (frame)  ->  luma 1/4 (L1, R8)  ->  luma 1/8 (L2, R8)
  *   block matching grosso em L2  ->  refino em L1  ->  mapa de movimento
  *   quadro intermediario = media de (atual deslocado, anterior deslocado)
  *   com fallback para o quadro atual onde a compensacao falha (oclusao).
+ *
+ * Nos shaders de busca, so os acumuladores de comparacao usam mediump;
+ * coordenadas de textura ficam em highp.
  */
 object Shaders {
 
-    /** Triangle strip de 4 vertices gerado so com gl_VertexID (sem VBO). */
     const val VERT = """#version 300 es
 out vec2 vUv;
 void main() {
@@ -21,7 +23,6 @@ void main() {
 }
 """
 
-    /** Textura externa (MediaProjection) -> textura RGBA normal. */
     const val FRAG_OES = """#version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
 precision highp float;
@@ -35,12 +36,7 @@ void main() {
 }
 """
 
-    /**
-     * Reducao com 4 amostras bilineares em +-uOff.
-     * uOff = 1 texel da origem  -> caixa 4x4 (frame -> L1)
-     * uOff = 0.5 texel da origem -> caixa 2x2 (L1 -> L2)
-     * Resultado: luminancia replicada em RGB.
-     */
+    /** Quadro RGBA -> luminancia (grava no canal R de uma textura R8). Caixa 4x4. */
     const val FRAG_DOWN = """#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -58,10 +54,26 @@ void main() {
 }
 """
 
+    /** Luminancia R8 -> luminancia R8 (media 2x2). Le so o canal R. */
+    const val FRAG_DOWN_R = """#version 300 es
+precision mediump float;
+precision mediump sampler2D;
+uniform sampler2D uSrc;
+uniform highp vec2 uOff;
+in highp vec2 vUv;
+out vec4 o;
+void main() {
+    float l = (texture(uSrc, vUv + vec2(-uOff.x, -uOff.y)).r
+             + texture(uSrc, vUv + vec2( uOff.x, -uOff.y)).r
+             + texture(uSrc, vUv + vec2(-uOff.x,  uOff.y)).r
+             + texture(uSrc, vUv + vec2( uOff.x,  uOff.y)).r) * 0.25;
+    o = vec4(l, l, l, 1.0);
+}
+"""
+
     /**
-     * Busca grossa em L2: para cada pixel, janela 3x3 do quadro atual e
-     * procura em +-R texels no quadro anterior (menor SAD).
-     * Convencao: atual(x) ~= anterior(x + v).
+     * Busca grossa em L2: janela 3x3 do quadro atual, procura em +-R texels
+     * no quadro anterior (menor SAD). Convencao: atual(x) ~= anterior(x + v).
      * Saida: rg = v/32 + 0.5 (texels L2), b = custo medio.
      */
     fun fragCoarse(r: Int): String {
@@ -70,13 +82,13 @@ void main() {
         val sb = StringBuilder()
         sb.append(
             """#version 300 es
-precision highp float;
-precision highp sampler2D;
+precision mediump float;
+precision mediump sampler2D;
 uniform sampler2D uCur;
 uniform sampler2D uPrev;
-uniform vec2 uTexel;
+uniform highp vec2 uTexel;
 uniform float uLambda;
-in vec2 vUv;
+in highp vec2 vUv;
 out vec4 o;
 void main() {
 """
@@ -85,12 +97,12 @@ void main() {
             sb.append("  float a$k = texture(uCur, vUv + vec2(${i}.0, ${j}.0) * uTexel).r;\n")
         }
         sb.append(
-            """  float best = 1e9;
+            """  float best = 1000.0;
   vec2 bv = vec2(0.0);
   for (int cy = -$r; cy <= $r; cy++) {
     for (int cx = -$r; cx <= $r; cx++) {
       vec2 c = vec2(float(cx), float(cy));
-      vec2 p = vUv + c * uTexel;
+      highp vec2 p = vUv + c * uTexel;
       float sad = 0.0;
 """
         )
@@ -118,14 +130,14 @@ void main() {
         val sb = StringBuilder()
         sb.append(
             """#version 300 es
-precision highp float;
-precision highp sampler2D;
+precision mediump float;
+precision mediump sampler2D;
 uniform sampler2D uCur;
 uniform sampler2D uPrev;
-uniform sampler2D uCoarse;
-uniform vec2 uTexel;
+uniform highp sampler2D uCoarse;
+uniform highp vec2 uTexel;
 uniform float uLambda;
-in vec2 vUv;
+in highp vec2 vUv;
 out vec4 o;
 void main() {
   vec4 cv = texelFetch(uCoarse, ivec2(gl_FragCoord.xy), 0);
@@ -138,12 +150,12 @@ void main() {
             k++
         }
         sb.append(
-            """  float best = 1e9;
+            """  float best = 1000.0;
   vec2 bv = base;
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
       vec2 d = vec2(float(dx), float(dy));
-      vec2 p = vUv + (base + d) * uTexel;
+      highp vec2 p = vUv + (base + d) * uTexel;
       float sad = 0.0;
 """
         )
@@ -164,12 +176,6 @@ void main() {
         return sb.toString()
     }
 
-    /**
-     * Quadro intermediario (t = 0.5).
-     * v = deslocamento atual->anterior (texels L1). Pixel y do quadro do meio:
-     *   atual(y - v/2) e anterior(y + v/2). Se os dois discordam muito
-     *   (oclusao / movimento errado) usa o quadro atual sem deslocar.
-     */
     const val FRAG_MID = """#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -192,7 +198,6 @@ void main() {
 }
 """
 
-    /** Apresentacao na tela com nitidez adaptativa leve (estilo CAS). */
     const val FRAG_PRESENT = """#version 300 es
 precision highp float;
 precision highp sampler2D;
