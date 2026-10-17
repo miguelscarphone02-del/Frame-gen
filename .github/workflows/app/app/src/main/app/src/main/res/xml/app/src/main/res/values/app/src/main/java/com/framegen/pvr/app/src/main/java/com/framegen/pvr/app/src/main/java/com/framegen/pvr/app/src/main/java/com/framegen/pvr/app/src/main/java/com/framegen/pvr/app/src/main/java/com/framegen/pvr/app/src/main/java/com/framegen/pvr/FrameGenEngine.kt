@@ -21,9 +21,12 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.max
 
 /**
- * Captura o app escolhido (MediaProjection, modo "um unico app"), gera um
- * quadro intermediario por quadro capturado e apresenta os dois na Surface
- * do overlay. Tudo roda numa thread propria com contexto GLES 3.0.
+ * Captura o app escolhido (MediaProjection, "um unico app"), gera um quadro
+ * extra por quadro capturado e apresenta os dois na Surface do overlay.
+ *
+ * Modo normal: mostra o quadro do meio (interpolado) na hora e o real depois.
+ * Modo baixa latencia: mostra o quadro real na hora e, meio intervalo depois,
+ * uma previsao do proximo meio passo (extrapolacao).
  *
  * O tamanho da captura segue o tamanho REAL da Surface do overlay.
  */
@@ -75,14 +78,17 @@ class FrameGenEngine(
     private var pCoarse: Prog? = null
     private var pRefine: Prog? = null
     private var pMid: Prog? = null
+    private var pExtrap: Prog? = null
     private var pPresent: Prog? = null
 
     // Alvos
     private var frames: Array<Target>? = null
     private var l1: Array<Target>? = null
     private var l2: Array<Target>? = null
-    private var coarse: Target? = null
-    private var fine: Target? = null
+    private var l3: Array<Target>? = null
+    private var coarse: Target? = null   // movimento em L3
+    private var flow2: Target? = null    // movimento em L2
+    private var fine: Target? = null     // movimento em L1 (final)
     private var mid: Target? = null
 
     // Estado do pipeline
@@ -100,6 +106,11 @@ class FrameGenEngine(
     private val presentCurrent = Runnable {
         val f = frames
         if (glReady && f != null && winSurface != EGL14.EGL_NO_SURFACE) present(f[ci].tex)
+    }
+
+    private val presentMid = Runnable {
+        val m = mid
+        if (glReady && m != null && winSurface != EGL14.EGL_NO_SURFACE) present(m.tex)
     }
 
     // ------------------------------------------------------------------
@@ -135,10 +146,7 @@ class FrameGenEngine(
         }
     }
 
-    /**
-     * Tamanho informado pelo sistema. So vale enquanto ainda nao sabemos o
-     * tamanho real da Surface; depois disso a Surface manda.
-     */
+    /** Tamanho informado pelo sistema; so vale enquanto nao sabemos o da Surface. */
     fun setDisplaySize(dispW: Int, dispH: Int) {
         h.post {
             if (!glReady || surfW > 0) return@post
@@ -196,9 +204,9 @@ class FrameGenEngine(
                 st = null
                 releaseTargets()
                 pOes?.delete(); pDown?.delete(); pDownR?.delete(); pCoarse?.delete()
-                pRefine?.delete(); pMid?.delete(); pPresent?.delete()
+                pRefine?.delete(); pMid?.delete(); pExtrap?.delete(); pPresent?.delete()
                 pOes = null; pDown = null; pDownR = null; pCoarse = null
-                pRefine = null; pMid = null; pPresent = null
+                pRefine = null; pMid = null; pExtrap = null; pPresent = null
                 if (oesTex != 0) GLES20.glDeleteTextures(1, intArrayOf(oesTex), 0)
                 oesTex = 0
             } catch (t: Throwable) {
@@ -299,6 +307,7 @@ class FrameGenEngine(
         pCoarse = Prog(Shaders.VERT, Shaders.fragCoarse(cfg.radius))
         pRefine = Prog(Shaders.VERT, Shaders.fragRefine())
         pMid = Prog(Shaders.VERT, Shaders.FRAG_MID)
+        pExtrap = Prog(Shaders.VERT, Shaders.FRAG_EXTRAP)
         pPresent = Prog(Shaders.VERT, Shaders.FRAG_PRESENT)
     }
 
@@ -308,12 +317,16 @@ class FrameGenEngine(
         val h1 = (capH + 3) / 4
         val w2 = (capW + 7) / 8
         val h2 = (capH + 7) / 8
+        val w3 = (capW + 15) / 16
+        val h3 = (capH + 15) / 16
         frames = arrayOf(GlUtil.createTarget(capW, capH), GlUtil.createTarget(capW, capH))
-        // Luminancia em 1 canal (R8): 4x menos memoria lida na busca de movimento.
+        // Luminancia em 1 canal (R8)
         l1 = arrayOf(GlUtil.createTarget(w1, h1, true), GlUtil.createTarget(w1, h1, true))
         l2 = arrayOf(GlUtil.createTarget(w2, h2, true), GlUtil.createTarget(w2, h2, true))
-        coarse = GlUtil.createTarget(w2, h2)
-        fine = GlUtil.createTarget(w2, h2)
+        l3 = arrayOf(GlUtil.createTarget(w3, h3, true), GlUtil.createTarget(w3, h3, true))
+        coarse = GlUtil.createTarget(w3, h3)
+        flow2 = GlUtil.createTarget(w2, h2)
+        fine = GlUtil.createTarget(w1, h1)
         mid = GlUtil.createTarget(capW, capH)
         havePrev = false
     }
@@ -322,7 +335,9 @@ class FrameGenEngine(
         frames?.forEach { it.release() }; frames = null
         l1?.forEach { it.release() }; l1 = null
         l2?.forEach { it.release() }; l2 = null
+        l3?.forEach { it.release() }; l3 = null
         coarse?.release(); coarse = null
+        flow2?.release(); flow2 = null
         fine?.release(); fine = null
         mid?.release(); mid = null
     }
@@ -368,6 +383,7 @@ class FrameGenEngine(
         val bypass = bypassed || !cfg.interpolate
 
         h.removeCallbacks(presentCurrent)
+        h.removeCallbacks(presentMid)
         listener.onFrame(bypass)
         publishStats(now)
 
@@ -380,19 +396,32 @@ class FrameGenEngine(
         val prev = ci
         ci = 1 - ci
         drawOes(f[ci])
-        buildPyramid(ci)
 
         val canInterp = havePrev && dtMs in 8f..110f
         havePrev = true
-        if (!canInterp) {
-            present(f[ci].tex)
-            return
-        }
+        val delay = max(1L, (emaMs * 0.5f).toLong())
 
-        runMotion(ci, prev)
-        drawMid(ci, prev)
-        mid?.let { present(it.tex) }
-        h.postDelayed(presentCurrent, max(1L, (emaMs * 0.5f).toLong()))
+        if (cfg.lowLatency) {
+            // 1) o quadro real aparece imediatamente (sem atraso extra)
+            present(f[ci].tex)
+            // 2) calcula movimento e a previsao de meio passo a frente
+            buildPyramid(ci)
+            if (canInterp) {
+                runMotion(ci, prev)
+                drawExtrap(ci, prev)
+                h.postDelayed(presentMid, delay)
+            }
+        } else {
+            buildPyramid(ci)
+            if (!canInterp) {
+                present(f[ci].tex)
+                return
+            }
+            runMotion(ci, prev)
+            drawMid(ci, prev)
+            mid?.let { present(it.tex) }
+            h.postDelayed(presentCurrent, delay)
+        }
     }
 
     private fun publishStats(now: Long) {
@@ -425,6 +454,7 @@ class FrameGenEngine(
         val f = frames ?: return
         val a = l1 ?: return
         val b = l2 ?: return
+        val c = l3 ?: return
 
         // Quadro RGBA -> L1 (luma, R8)
         p.use()
@@ -434,12 +464,17 @@ class FrameGenEngine(
         p.f2("uOff", 1f / f[i].w, 1f / f[i].h)
         GlUtil.drawQuad()
 
-        // L1 (R8) -> L2 (R8)
+        // L1 -> L2 -> L3 (R8 -> R8)
         pr.use()
         pr.i1("uSrc", 0)
         GlUtil.bindTarget(b[i])
         GlUtil.bindTex2D(0, a[i].tex)
         pr.f2("uOff", 0.5f / a[i].w, 0.5f / a[i].h)
+        GlUtil.drawQuad()
+
+        GlUtil.bindTarget(c[i])
+        GlUtil.bindTex2D(0, b[i].tex)
+        pr.f2("uOff", 0.5f / b[i].w, 0.5f / b[i].h)
         GlUtil.drawQuad()
     }
 
@@ -448,34 +483,50 @@ class FrameGenEngine(
         val pr = pRefine ?: return
         val a1 = l1 ?: return
         val a2 = l2 ?: return
-        val c = coarse ?: return
-        val fi = fine ?: return
+        val a3 = l3 ?: return
+        val c3 = coarse ?: return
+        val f2 = flow2 ?: return
+        val f1 = fine ?: return
 
-        GlUtil.bindTarget(c)
+        // Busca grossa em L3 (1/16)
+        GlUtil.bindTarget(c3)
         pc.use()
-        GlUtil.bindTex2D(0, a2[cur].tex)
-        GlUtil.bindTex2D(1, a2[prev].tex)
+        GlUtil.bindTex2D(0, a3[cur].tex)
+        GlUtil.bindTex2D(1, a3[prev].tex)
         pc.i1("uCur", 0)
         pc.i1("uPrev", 1)
-        pc.f2("uTexel", 1f / a2[cur].w, 1f / a2[cur].h)
+        pc.f2("uTexel", 1f / a3[cur].w, 1f / a3[cur].h)
         pc.f1("uLambda", 0.02f)
         GlUtil.drawQuad()
 
-        GlUtil.bindTarget(fi)
+        // Refino em L2 (1/8)
+        GlUtil.bindTarget(f2)
         pr.use()
-        GlUtil.bindTex2D(0, a1[cur].tex)
-        GlUtil.bindTex2D(1, a1[prev].tex)
-        GlUtil.bindTex2D(2, c.tex)
+        GlUtil.bindTex2D(0, a2[cur].tex)
+        GlUtil.bindTex2D(1, a2[prev].tex)
+        GlUtil.bindTex2D(2, c3.tex)
         pr.i1("uCur", 0)
         pr.i1("uPrev", 1)
         pr.i1("uCoarse", 2)
-        pr.f2("uTexel", 1f / a1[cur].w, 1f / a1[cur].h)
+        pr.f2("uTexel", 1f / a2[cur].w, 1f / a2[cur].h)
         pr.f1("uLambda", 0.015f)
+        GlUtil.drawQuad()
+
+        // Refino em L1 (1/4)
+        GlUtil.bindTarget(f1)
+        GlUtil.bindTex2D(0, a1[cur].tex)
+        GlUtil.bindTex2D(1, a1[prev].tex)
+        GlUtil.bindTex2D(2, f2.tex)
+        pr.f2("uTexel", 1f / a1[cur].w, 1f / a1[cur].h)
         GlUtil.drawQuad()
     }
 
-    private fun drawMid(cur: Int, prev: Int) {
-        val p = pMid ?: return
+    private fun drawMid(cur: Int, prev: Int) = drawFlowFrame(pMid, cur, prev)
+
+    private fun drawExtrap(cur: Int, prev: Int) = drawFlowFrame(pExtrap, cur, prev)
+
+    private fun drawFlowFrame(p: Prog?, cur: Int, prev: Int) {
+        if (p == null) return
         val f = frames ?: return
         val a1 = l1 ?: return
         val m = mid ?: return
