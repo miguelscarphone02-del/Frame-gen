@@ -43,8 +43,10 @@ class ProjectionService : Service() {
             Bus.overlay?.setCaptureVisible(isVisible)
         }
 
-        override fun onCapturedContentResize(width: Int, height: Int) {}
-    }
+                override fun onCapturedContentResize(width: Int, height: Int) {
+            Bus.overlay?.onCaptureResize(width, height)
+        }
+    
 
     override fun onBind(intent: Intent?): IBinder? = null
 
