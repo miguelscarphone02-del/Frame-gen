@@ -25,10 +25,7 @@ import kotlin.math.max
  * quadro intermediario por quadro capturado e apresenta os dois na Surface
  * do overlay. Tudo roda numa thread propria com contexto GLES 3.0.
  *
- * Linha do tempo (jogo a 30 FPS -> saida ~60 FPS):
- *   chega quadro N  -> mostra meio(N-1, N) imediatamente
- *                   -> mostra N depois de metade do intervalo medio
- * A latencia extra e ~metade do intervalo entre quadros (~16 ms a 30 FPS).
+ * O tamanho da captura segue o tamanho REAL da Surface do overlay.
  */
 class FrameGenEngine(
     private val cfg: FgConfig,
@@ -36,7 +33,6 @@ class FrameGenEngine(
     private val listener: Listener
 ) {
     interface Listener {
-        /** Chamado (thread GL) a cada quadro capturado. bypass = jogo rapido demais, nao interpolar. */
         fun onFrame(bypass: Boolean)
         fun onStats(srcFps: Int, outFps: Int, emaMs: Float)
         fun onError(msg: String)
@@ -57,6 +53,10 @@ class FrameGenEngine(
     private var eglConfig: EGLConfig? = null
     private var pbuffer: EGLSurface = EGL14.EGL_NO_SURFACE
     private var winSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+
+    // Tamanho real da Surface do overlay (0 = ainda desconhecido)
+    private var surfW = 0
+    private var surfH = 0
 
     // Captura
     private var projection: MediaProjection? = null
@@ -134,23 +134,14 @@ class FrameGenEngine(
         }
     }
 
-    /** Rotacao de tela / mudanca de tamanho do display. */
+    /**
+     * Tamanho informado pelo sistema. So vale enquanto ainda nao sabemos o
+     * tamanho real da Surface; depois disso a Surface manda.
+     */
     fun setDisplaySize(dispW: Int, dispH: Int) {
         h.post {
-            if (!glReady) return@post
-            val nw = even(dispW * cfg.scale)
-            val nh = even(dispH * cfg.scale)
-            if (nw == capW && nh == capH) return@post
-            capW = nw
-            capH = nh
-            try {
-                st?.setDefaultBufferSize(capW, capH)
-                vd?.resize(capW, capH, dpi)
-                allocTargets()
-                havePrev = false
-            } catch (t: Throwable) {
-                Log.e(TAG, "Falha ao redimensionar", t)
-            }
+            if (!glReady || surfW > 0) return@post
+            applyCaptureSize(dispW, dispH)
         }
     }
 
@@ -167,6 +158,16 @@ class FrameGenEngine(
             EGL14.eglMakeCurrent(eglDisplay, winSurface, winSurface, eglContext)
             EGL14.eglSwapInterval(eglDisplay, 1)
             havePrev = false
+
+            EGL14.eglQuerySurface(eglDisplay, winSurface, EGL14.EGL_WIDTH, sizeQuery, 0)
+            val w = sizeQuery[0]
+            EGL14.eglQuerySurface(eglDisplay, winSurface, EGL14.EGL_HEIGHT, sizeQuery, 0)
+            val hh = sizeQuery[0]
+            if (w > 0 && hh > 0) {
+                surfW = w
+                surfH = hh
+                if (glReady) applyCaptureSize(w, hh)
+            }
         }
     }
 
@@ -224,6 +225,25 @@ class FrameGenEngine(
 
     private fun even(v: Float): Int = max(2, (v.toInt() / 2) * 2)
 
+    /** Ajusta a captura para (w x h) * escala. Roda na thread GL. */
+    private fun applyCaptureSize(w: Int, hh: Int) {
+        if (!glReady || w <= 0 || hh <= 0) return
+        val nw = even(w * cfg.scale)
+        val nh = even(hh * cfg.scale)
+        if (nw == capW && nh == capH) return
+        capW = nw
+        capH = nh
+        try {
+            st?.setDefaultBufferSize(capW, capH)
+            vd?.resize(capW, capH, dpi)
+            allocTargets()
+            havePrev = false
+            Log.i(TAG, "Captura redimensionada: ${capW}x$capH")
+        } catch (t: Throwable) {
+            Log.e(TAG, "Falha ao redimensionar", t)
+        }
+    }
+
     private fun initEgl() {
         eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
         val ver = IntArray(2)
@@ -244,7 +264,6 @@ class FrameGenEngine(
         if (n[0] <= 0 || cfgs[0] == null) throw RuntimeException("Nenhuma EGLConfig ES3 RGBA8 encontrada")
         eglConfig = cfgs[0]
 
-        // PowerVR expoe EGL_IMG_context_priority: pede prioridade alta para o contexto.
         var ctx = EGL14.eglCreateContext(
             eglDisplay, eglConfig, EGL14.EGL_NO_CONTEXT,
             intArrayOf(
@@ -314,6 +333,8 @@ class FrameGenEngine(
             winSurface = EGL14.EGL_NO_SURFACE
             havePrev = false
         }
+        surfW = 0
+        surfH = 0
     }
 
     // ------------------------------------------------------------------
@@ -336,7 +357,6 @@ class FrameGenEngine(
         srcCount++
         if (dtMs in 4f..150f) emaMs = if (emaMs == 0f) dtMs else emaMs * 0.8f + dtMs * 0.2f
 
-        // Histerese: jogo >~55 FPS nao precisa de interpolacao -> esconde o overlay.
         if (cfg.bypassHigh) {
             if (emaMs in 0.1f..17.5f) bypassed = true else if (emaMs > 24f) bypassed = false
         } else {
@@ -423,7 +443,6 @@ class FrameGenEngine(
         val c = coarse ?: return
         val fi = fine ?: return
 
-        // Grosso (L2)
         GlUtil.bindTarget(c)
         pc.use()
         GlUtil.bindTex2D(0, a2[cur].tex)
@@ -434,7 +453,6 @@ class FrameGenEngine(
         pc.f1("uLambda", 0.02f)
         GlUtil.drawQuad()
 
-        // Refino (L1)
         GlUtil.bindTarget(fi)
         pr.use()
         GlUtil.bindTex2D(0, a1[cur].tex)
@@ -475,6 +493,13 @@ class FrameGenEngine(
         EGL14.eglQuerySurface(eglDisplay, winSurface, EGL14.EGL_HEIGHT, sizeQuery, 0)
         val hh = sizeQuery[0]
         if (w <= 0 || hh <= 0) return
+
+        // A Surface mudou de tamanho (rotacao etc.): ajusta a captura no proximo ciclo.
+        if (w != surfW || hh != surfH) {
+            surfW = w
+            surfH = hh
+            h.post { applyCaptureSize(w, hh) }
+        }
 
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         GLES20.glViewport(0, 0, w, hh)
