@@ -1,16 +1,14 @@
 package com.framegen.pvr
 
 /**
- * Todos os shaders do pipeline (OpenGL ES 3.0).
+ * Pipeline (OpenGL ES 3.0), por quadro capturado:
+ *   OES -> RGBA (frame) -> luma L1 (1/4) -> L2 (1/8) -> L3 (1/16)   [L1..L3 em R8]
+ *   busca grossa em L3 (+-R) -> refino em L2 (+-1) -> refino em L1 (+-1)
+ *   -> mapa de movimento em 1/4 da resolucao
+ *   interpolacao: quadro do meio entre anterior e atual
+ *   extrapolacao: quadro atual avancado meio passo (baixa latencia)
  *
- * Pipeline por quadro capturado:
- *   OES -> RGBA (frame)  ->  luma 1/4 (L1, R8)  ->  luma 1/8 (L2, R8)
- *   block matching grosso em L2  ->  refino em L1  ->  mapa de movimento
- *   quadro intermediario = media de (atual deslocado, anterior deslocado)
- *   com fallback para o quadro atual onde a compensacao falha (oclusao).
- *
- * Nos shaders de busca, so os acumuladores de comparacao usam mediump;
- * coordenadas de textura ficam em highp.
+ * Vetores: rg = v/64 + 0.5 (texels do proprio nivel), b = custo medio.
  */
 object Shaders {
 
@@ -36,7 +34,7 @@ void main() {
 }
 """
 
-    /** Quadro RGBA -> luminancia (grava no canal R de uma textura R8). Caixa 4x4. */
+    /** Quadro RGBA -> luminancia (grava em textura R8). Caixa 4x4. */
     const val FRAG_DOWN = """#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -54,7 +52,7 @@ void main() {
 }
 """
 
-    /** Luminancia R8 -> luminancia R8 (media 2x2). Le so o canal R. */
+    /** Luminancia R8 -> luminancia R8 (media 2x2). */
     const val FRAG_DOWN_R = """#version 300 es
 precision mediump float;
 precision mediump sampler2D;
@@ -72,9 +70,8 @@ void main() {
 """
 
     /**
-     * Busca grossa em L2: janela 3x3 do quadro atual, procura em +-R texels
-     * no quadro anterior (menor SAD). Convencao: atual(x) ~= anterior(x + v).
-     * Saida: rg = v/32 + 0.5 (texels L2), b = custo medio.
+     * Busca grossa no nivel mais pequeno (L3): janela 3x3 do quadro atual,
+     * procura +-R texels no anterior (menor SAD). atual(x) ~= anterior(x + v).
      */
     fun fragCoarse(r: Int): String {
         val win = ArrayList<Pair<Int, Int>>()
@@ -114,7 +111,7 @@ void main() {
       if (sad < best) { best = sad; bv = c; }
     }
   }
-  o = vec4(bv / 32.0 + 0.5, best / 9.0, 1.0);
+  o = vec4(bv / 64.0 + 0.5, best / 9.0, 1.0);
 }
 """
         )
@@ -122,11 +119,12 @@ void main() {
     }
 
     /**
-     * Refino em L1: parte do vetor grosso (x2) e testa +-1 texel, janela 4x4.
-     * Saida: rg = v/32 + 0.5 (texels L1).
+     * Refino: parte do vetor do nivel mais grosso (x2) e testa +-1 texel,
+     * janela 3x3. Serve para L2 e L1 (o nivel grosso tem metade do tamanho).
      */
     fun fragRefine(): String {
-        val offs = floatArrayOf(-1.5f, -0.5f, 0.5f, 1.5f)
+        val win = ArrayList<Pair<Int, Int>>()
+        for (j in -1..1) for (i in -1..1) win.add(i to j)
         val sb = StringBuilder()
         sb.append(
             """#version 300 es
@@ -140,14 +138,12 @@ uniform float uLambda;
 in highp vec2 vUv;
 out vec4 o;
 void main() {
-  vec4 cv = texelFetch(uCoarse, ivec2(gl_FragCoord.xy), 0);
-  vec2 base = floor((cv.rg - 0.5) * 32.0 + 0.5) * 2.0;
+  vec4 cv = texelFetch(uCoarse, ivec2(gl_FragCoord.xy) / 2, 0);
+  vec2 base = floor((cv.rg - 0.5) * 64.0 + 0.5) * 2.0;
 """
         )
-        var k = 0
-        for (oy in offs) for (ox in offs) {
-            sb.append("  float a$k = texture(uCur, vUv + vec2($ox, $oy) * uTexel).r;\n")
-            k++
+        win.forEachIndexed { k, (i, j) ->
+            sb.append("  float a$k = texture(uCur, vUv + vec2(${i}.0, ${j}.0) * uTexel).r;\n")
         }
         sb.append(
             """  float best = 1000.0;
@@ -159,23 +155,25 @@ void main() {
       float sad = 0.0;
 """
         )
-        k = 0
-        for (oy in offs) for (ox in offs) {
-            sb.append("      sad += abs(a$k - texture(uPrev, p + vec2($ox, $oy) * uTexel).r);\n")
-            k++
+        win.forEachIndexed { k, (i, j) ->
+            sb.append("      sad += abs(a$k - texture(uPrev, p + vec2(${i}.0, ${j}.0) * uTexel).r);\n")
         }
         sb.append(
             """      sad += uLambda * length(d);
       if (sad < best) { best = sad; bv = base + d; }
     }
   }
-  o = vec4(bv / 32.0 + 0.5, best / 16.0, 1.0);
+  o = vec4(bv / 64.0 + 0.5, best / 9.0, 1.0);
 }
 """
         )
         return sb.toString()
     }
 
+    /**
+     * Interpolacao (t = 0.5): mistura atual deslocado e anterior deslocado.
+     * Onde os dois discordam ou o custo do movimento e alto, usa o quadro atual.
+     */
     const val FRAG_MID = """#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -187,14 +185,41 @@ uniform vec2 uErr;
 in vec2 vUv;
 out vec4 o;
 void main() {
-    vec2 v = (texture(uFlow, vUv).rg - 0.5) * 32.0;
-    vec2 off = v * uInvL1;
+    vec3 fl = texture(uFlow, vUv).rgb;
+    vec2 off = (fl.rg - 0.5) * 64.0 * uInvL1;
     vec3 a = texture(uCur,  vUv - 0.5 * off).rgb;
     vec3 b = texture(uPrev, vUv + 0.5 * off).rgb;
     vec3 c0 = texture(uCur, vUv).rgb;
     float err = dot(abs(a - b), vec3(0.3333));
-    float w = smoothstep(uErr.x, uErr.y, err);
+    float w = max(smoothstep(uErr.x, uErr.y, err), smoothstep(0.10, 0.25, fl.b));
     o = vec4(mix(0.5 * (a + b), c0, w), 1.0);
+}
+"""
+
+    /**
+     * Extrapolacao (baixa latencia): quadro atual avancado meio passo.
+     * out(y) = atual(y + v/2). Onde a previsao e duvidosa, repete o quadro atual.
+     */
+    const val FRAG_EXTRAP = """#version 300 es
+precision highp float;
+precision highp sampler2D;
+uniform sampler2D uCur;
+uniform sampler2D uPrev;
+uniform sampler2D uFlow;
+uniform vec2 uInvL1;
+uniform vec2 uErr;
+in vec2 vUv;
+out vec4 o;
+void main() {
+    vec3 fl = texture(uFlow, vUv).rgb;
+    vec2 off = (fl.rg - 0.5) * 64.0 * uInvL1;
+    vec3 c0 = texture(uCur, vUv).rgb;
+    vec2 q = vUv + 0.5 * off;
+    vec3 e = texture(uCur, q).rgb;
+    vec3 p = texture(uPrev, q + off).rgb;
+    float err = dot(abs(e - p), vec3(0.3333));
+    float w = max(smoothstep(uErr.x, uErr.y, err), smoothstep(0.10, 0.25, fl.b));
+    o = vec4(mix(e, c0, w), 1.0);
 }
 """
 
