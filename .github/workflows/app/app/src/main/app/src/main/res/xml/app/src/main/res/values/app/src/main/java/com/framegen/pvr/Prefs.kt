@@ -16,7 +16,8 @@ data class FgConfig(
     val hud: Boolean,
     val bypassHigh: Boolean,  // se o jogo ja passa de ~50 FPS, nao interpola
     val interpolate: Boolean,
-    val lowLatency: Boolean   // mostra o quadro real na hora e preve o proximo
+    val lowLatency: Boolean,  // mostra o quadro real na hora e preve o proximo
+    val protect: Float        // 0..1: quanto o app desconfia da estimativa de movimento
 )
 
 object Prefs {
@@ -38,6 +39,9 @@ object Prefs {
     fun getSharpen(c: Context) = sp(c).getInt("sharpen", 0)
     fun setSharpen(c: Context, v: Int) = sp(c).edit().putInt("sharpen", v).apply()
 
+    fun getProtect(c: Context) = sp(c).getInt("protect", 70)
+    fun setProtect(c: Context, v: Int) = sp(c).edit().putInt("protect", v).apply()
+
     fun getHud(c: Context) = sp(c).getBoolean("hud", true)
     fun setHud(c: Context, v: Boolean) = sp(c).edit().putBoolean("hud", v).apply()
 
@@ -57,6 +61,7 @@ object Prefs {
         hud = getHud(c),
         bypassHigh = getBypass(c),
         interpolate = getInterpolate(c),
-        lowLatency = getLowLat(c)
+        lowLatency = getLowLat(c),
+        protect = getProtect(c) / 100f
     )
 }
