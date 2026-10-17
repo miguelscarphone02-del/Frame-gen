@@ -47,6 +47,12 @@ class FrameGenEngine(
         const val EGL_CONTEXT_PRIORITY_HIGH_IMG = 0x3101
     }
 
+    // Limiares de confianca (dependem do slider "Protecao contra distorcao")
+    private val costLo = 0.15f - 0.12f * cfg.protect
+    private val costHi = 0.30f - 0.21f * cfg.protect
+    private val errLo = 0.12f - 0.09f * cfg.protect
+    private val errHi = 0.30f - 0.20f * cfg.protect
+
     private val thread = HandlerThread("framegen-gl", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
     private val h = Handler(thread.looper)
 
@@ -77,6 +83,8 @@ class FrameGenEngine(
     private var pDownR: Prog? = null
     private var pCoarse: Prog? = null
     private var pRefine: Prog? = null
+    private var pMedian: Prog? = null
+    private var pSub: Prog? = null
     private var pMid: Prog? = null
     private var pExtrap: Prog? = null
     private var pPresent: Prog? = null
@@ -86,9 +94,11 @@ class FrameGenEngine(
     private var l1: Array<Target>? = null
     private var l2: Array<Target>? = null
     private var l3: Array<Target>? = null
-    private var coarse: Target? = null   // movimento em L3
-    private var flow2: Target? = null    // movimento em L2
-    private var fine: Target? = null     // movimento em L1 (final)
+    private var coarse: Target? = null    // movimento em L3
+    private var flow2: Target? = null     // movimento em L2
+    private var flowRaw: Target? = null   // movimento em L1 (inteiro)
+    private var flowMed: Target? = null   // movimento em L1 (mediano)
+    private var fine: Target? = null      // movimento final em L1 (sub-pixel)
     private var mid: Target? = null
 
     // Estado do pipeline
@@ -204,9 +214,11 @@ class FrameGenEngine(
                 st = null
                 releaseTargets()
                 pOes?.delete(); pDown?.delete(); pDownR?.delete(); pCoarse?.delete()
-                pRefine?.delete(); pMid?.delete(); pExtrap?.delete(); pPresent?.delete()
+                pRefine?.delete(); pMedian?.delete(); pSub?.delete()
+                pMid?.delete(); pExtrap?.delete(); pPresent?.delete()
                 pOes = null; pDown = null; pDownR = null; pCoarse = null
-                pRefine = null; pMid = null; pExtrap = null; pPresent = null
+                pRefine = null; pMedian = null; pSub = null
+                pMid = null; pExtrap = null; pPresent = null
                 if (oesTex != 0) GLES20.glDeleteTextures(1, intArrayOf(oesTex), 0)
                 oesTex = 0
             } catch (t: Throwable) {
@@ -306,6 +318,8 @@ class FrameGenEngine(
         pDownR = Prog(Shaders.VERT, Shaders.FRAG_DOWN_R)
         pCoarse = Prog(Shaders.VERT, Shaders.fragCoarse(cfg.radius))
         pRefine = Prog(Shaders.VERT, Shaders.fragRefine())
+        pMedian = Prog(Shaders.VERT, Shaders.FRAG_MEDIAN)
+        pSub = Prog(Shaders.VERT, Shaders.fragSubpixel())
         pMid = Prog(Shaders.VERT, Shaders.FRAG_MID)
         pExtrap = Prog(Shaders.VERT, Shaders.FRAG_EXTRAP)
         pPresent = Prog(Shaders.VERT, Shaders.FRAG_PRESENT)
@@ -326,6 +340,8 @@ class FrameGenEngine(
         l3 = arrayOf(GlUtil.createTarget(w3, h3, true), GlUtil.createTarget(w3, h3, true))
         coarse = GlUtil.createTarget(w3, h3)
         flow2 = GlUtil.createTarget(w2, h2)
+        flowRaw = GlUtil.createTarget(w1, h1)
+        flowMed = GlUtil.createTarget(w1, h1)
         fine = GlUtil.createTarget(w1, h1)
         mid = GlUtil.createTarget(capW, capH)
         havePrev = false
@@ -338,6 +354,8 @@ class FrameGenEngine(
         l3?.forEach { it.release() }; l3 = null
         coarse?.release(); coarse = null
         flow2?.release(); flow2 = null
+        flowRaw?.release(); flowRaw = null
+        flowMed?.release(); flowMed = null
         fine?.release(); fine = null
         mid?.release(); mid = null
     }
@@ -481,14 +499,18 @@ class FrameGenEngine(
     private fun runMotion(cur: Int, prev: Int) {
         val pc = pCoarse ?: return
         val pr = pRefine ?: return
+        val pm = pMedian ?: return
+        val ps = pSub ?: return
         val a1 = l1 ?: return
         val a2 = l2 ?: return
         val a3 = l3 ?: return
         val c3 = coarse ?: return
         val f2 = flow2 ?: return
+        val raw = flowRaw ?: return
+        val med = flowMed ?: return
         val f1 = fine ?: return
 
-        // Busca grossa em L3 (1/16)
+        // 1) Busca grossa em L3 (1/16)
         GlUtil.bindTarget(c3)
         pc.use()
         GlUtil.bindTex2D(0, a3[cur].tex)
@@ -499,7 +521,7 @@ class FrameGenEngine(
         pc.f1("uLambda", 0.02f)
         GlUtil.drawQuad()
 
-        // Refino em L2 (1/8)
+        // 2) Refino em L2 (1/8)
         GlUtil.bindTarget(f2)
         pr.use()
         GlUtil.bindTex2D(0, a2[cur].tex)
@@ -512,12 +534,33 @@ class FrameGenEngine(
         pr.f1("uLambda", 0.015f)
         GlUtil.drawQuad()
 
-        // Refino em L1 (1/4)
-        GlUtil.bindTarget(f1)
+        // 3) Refino em L1 (1/4), vetores inteiros
+        GlUtil.bindTarget(raw)
+        pr.use()
         GlUtil.bindTex2D(0, a1[cur].tex)
         GlUtil.bindTex2D(1, a1[prev].tex)
         GlUtil.bindTex2D(2, f2.tex)
         pr.f2("uTexel", 1f / a1[cur].w, 1f / a1[cur].h)
+        GlUtil.drawQuad()
+
+        // 4) Filtro mediano 3x3 (remove vetores soltos)
+        GlUtil.bindTarget(med)
+        pm.use()
+        GlUtil.bindTex2D(0, raw.tex)
+        pm.i1("uFlow", 0)
+        GlUtil.drawQuad()
+
+        // 5) Refino sub-pixel (+-0.5 texel) e custo final
+        GlUtil.bindTarget(f1)
+        ps.use()
+        GlUtil.bindTex2D(0, a1[cur].tex)
+        GlUtil.bindTex2D(1, a1[prev].tex)
+        GlUtil.bindTex2D(2, med.tex)
+        ps.i1("uCur", 0)
+        ps.i1("uPrev", 1)
+        ps.i1("uFlow", 2)
+        ps.f2("uTexel", 1f / a1[cur].w, 1f / a1[cur].h)
+        ps.f1("uLambda", 0.01f)
         GlUtil.drawQuad()
     }
 
@@ -540,7 +583,8 @@ class FrameGenEngine(
         p.i1("uPrev", 1)
         p.i1("uFlow", 2)
         p.f2("uInvL1", 1f / a1[cur].w, 1f / a1[cur].h)
-        p.f2("uErr", 0.06f, 0.18f)
+        p.f2("uErr", errLo, errHi)
+        p.f2("uCost", costLo, costHi)
         GlUtil.drawQuad()
     }
 
