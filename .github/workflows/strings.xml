@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FrameGen PVR</string>
+    <string name="a11y_label">FrameGen PVR (overlay)</string>
+    <string name="a11y_desc">Usado somente para desenhar a camada de tela com os quadros interpolados por cima do jogo. O app nao le o conteudo da tela por este servico e nao envia nada para a internet.</string>
+</resources>
