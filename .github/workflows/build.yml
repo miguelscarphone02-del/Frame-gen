@@ -10,6 +10,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Montar projeto
+        run: |
+          SRC=".github/workflows"
+          P="$GITHUB_WORKSPACE/_proj"
+          J="$P/app/src/main/java/com/framegen/pvr"
+          mkdir -p "$J" "$P/app/src/main/res/xml" "$P/app/src/main/res/values"
+          MISSING=""
+          get() {
+            f=$(find "$SRC" -type f -name "$1" | head -n1)
+            if [ -z "$f" ]; then MISSING="$MISSING $1"; else cp "$f" "$2"; fi
+          }
+          for k in MainActivity FrameGenAccessibilityService FrameGenEngine GlUtil Prefs ProjectionService Shaders; do
+            get "$k.kt" "$J/"
+          done
+          get AndroidManifest.xml "$P/app/src/main/"
+          get accessibility_service_config.xml "$P/app/src/main/res/xml/"
+          get strings.xml "$P/app/src/main/res/values/"
+          get themes.xml "$P/app/src/main/res/values/"
+          get settings.gradle.kts "$P/"
+          get gradle.properties "$P/"
+          for f in $(find "$SRC" -type f -name build.gradle.kts); do
+            if grep -q "apply false" "$f"; then cp "$f" "$P/build.gradle.kts"; else cp "$f" "$P/app/build.gradle.kts"; fi
+          done
+          [ -f "$P/build.gradle.kts" ] || MISSING="$MISSING build.gradle.kts(raiz)"
+          [ -f "$P/app/build.gradle.kts" ] || MISSING="$MISSING app/build.gradle.kts"
+          if [ -n "$MISSING" ]; then echo "ARQUIVOS FALTANDO:$MISSING"; exit 1; fi
+          find "$P" -type f
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -20,12 +48,10 @@ jobs:
           gradle-version: "8.9"
 
       - name: Build debug APK
-        working-directory: .github/workflows
+        working-directory: _proj
         run: gradle --no-daemon assembleDebug
 
       - uses: actions/upload-artifact@v4
         with:
           name: FrameGenPVR-debug-apk
-          path: .github/workflows/app/build/outputs/apk/debug/app-debug.apk
-          include-hidden-files: true
-          
+          path: _proj/app/build/outputs/apk/debug/app-debug.apk
