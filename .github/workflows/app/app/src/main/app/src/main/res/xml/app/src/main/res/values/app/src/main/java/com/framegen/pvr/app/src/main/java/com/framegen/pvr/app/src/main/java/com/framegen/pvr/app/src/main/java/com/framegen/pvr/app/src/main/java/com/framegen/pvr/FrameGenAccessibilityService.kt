@@ -76,14 +76,16 @@ class FrameGenAccessibilityService : AccessibilityService() {
     }
 
     /** O app capturado ficou visivel/invisivel (callback do MediaProjection, Android 14). */
-    fun setCaptureVisible(visible: Boolean) {    /** O tamanho real do app capturado mudou (Android 14). */
-    fun onCaptureResize(w: Int, h: Int) {
-        engine?.setDisplaySize(w, h)
-    }
+    fun setCaptureVisible(visible: Boolean) {
         main.post {
             captureVisible = visible
             applyOverlay(false)
         }
+    }
+
+    /** O tamanho real do app capturado mudou (Android 14). */
+    fun onCaptureResize(w: Int, h: Int) {
+        engine?.setDisplaySize(w, h)
     }
 
     // ------------------------------------------------------------------
