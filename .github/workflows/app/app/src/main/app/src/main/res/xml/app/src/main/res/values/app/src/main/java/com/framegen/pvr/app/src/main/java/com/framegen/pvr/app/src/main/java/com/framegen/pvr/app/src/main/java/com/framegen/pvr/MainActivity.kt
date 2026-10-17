@@ -84,6 +84,12 @@ class MainActivity : Activity() {
         })
 
         col.addView(check("Interpolacao ligada", Prefs.getInterpolate(this)) { Prefs.setInterpolate(this, it) })
+        col.addView(
+            check(
+                "Baixa latencia (preve o proximo quadro, menos atraso no toque)",
+                Prefs.getLowLat(this)
+            ) { Prefs.setLowLat(this, it) }
+        )
         col.addView(check("Mostrar FPS na tela", Prefs.getHud(this)) { Prefs.setHud(this, it) })
         col.addView(
             check(
