@@ -2,13 +2,14 @@ package com.framegen.pvr
 
 /**
  * Pipeline (OpenGL ES 3.0), por quadro capturado:
- *   OES -> RGBA (frame) -> luma L1 (1/4) -> L2 (1/8) -> L3 (1/16)   [L1..L3 em R8]
- *   busca grossa em L3 (+-R) -> refino em L2 (+-1) -> refino em L1 (+-1)
- *   -> filtro mediano 3x3 -> refino sub-pixel (meio texel) -> mapa final (1/4)
+ *   OES -> RGBA (frame) -> luma L1 (1/4) -> L2 (1/8) -> L3 (1/16) -> L4 (1/32)   [R8]
+ *   busca grossa em L4 (+-R) -> refino L3 -> L2 -> L1 (+-1 cada)
+ *   -> filtro mediano 3x3 -> refino sub-pixel -> mapa final (1/4)
  *   interpolacao: quadro do meio entre anterior e atual
  *   extrapolacao: quadro atual avancado meio passo (baixa latencia)
  *
- * Vetores: rg = v/64 + 0.5 (texels do proprio nivel), b = custo medio.
+ * Vetores: rg = v/vs + 0.5 (texels do proprio nivel), b = custo medio.
+ * vs = 256 com texturas float16, 64 com texturas de 8 bits.
  */
 object Shaders {
 
@@ -70,10 +71,10 @@ void main() {
 """
 
     /**
-     * Busca grossa no nivel mais pequeno (L3): janela 3x3 do quadro atual,
+     * Busca grossa no nivel mais pequeno (L4): janela 3x3 do quadro atual,
      * procura +-R texels no anterior (menor SAD). atual(x) ~= anterior(x + v).
      */
-    fun fragCoarse(r: Int): String {
+    fun fragCoarse(r: Int, vs: Float): String {
         val win = ArrayList<Pair<Int, Int>>()
         for (j in -1..1) for (i in -1..1) win.add(i to j)
         val sb = StringBuilder()
@@ -111,7 +112,7 @@ void main() {
       if (sad < best) { best = sad; bv = c; }
     }
   }
-  o = vec4(bv / 64.0 + 0.5, best / 9.0, 1.0);
+  o = vec4(bv / $vs + 0.5, best / 9.0, 1.0);
 }
 """
         )
@@ -120,9 +121,9 @@ void main() {
 
     /**
      * Refino: parte do vetor do nivel mais grosso (x2) e testa +-1 texel,
-     * janela 3x3. Serve para L2 e L1 (o nivel grosso tem metade do tamanho).
+     * janela 3x3. Serve para L3, L2 e L1.
      */
-    fun fragRefine(): String {
+    fun fragRefine(vs: Float): String {
         val win = ArrayList<Pair<Int, Int>>()
         for (j in -1..1) for (i in -1..1) win.add(i to j)
         val sb = StringBuilder()
@@ -139,7 +140,7 @@ in highp vec2 vUv;
 out vec4 o;
 void main() {
   vec4 cv = texelFetch(uCoarse, ivec2(gl_FragCoord.xy) / 2, 0);
-  vec2 base = floor((cv.rg - 0.5) * 64.0 + 0.5) * 2.0;
+  highp vec2 base = floor((cv.rg - 0.5) * $vs + 0.5) * 2.0;
 """
         )
         win.forEachIndexed { k, (i, j) ->
@@ -147,7 +148,7 @@ void main() {
         }
         sb.append(
             """  float best = 1000.0;
-  vec2 bv = base;
+  highp vec2 bv = base;
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
       vec2 d = vec2(float(dx), float(dy));
@@ -163,7 +164,7 @@ void main() {
       if (sad < best) { best = sad; bv = base + d; }
     }
   }
-  o = vec4(bv / 64.0 + 0.5, best / 9.0, 1.0);
+  o = vec4(bv / $vs + 0.5, best / 9.0, 1.0);
 }
 """
         )
@@ -210,11 +211,8 @@ void main() {
 }
 """
 
-    /**
-     * Refino sub-pixel em L1: testa +-0.5 texel em volta do vetor (ja filtrado)
-     * e recalcula o custo com o vetor final.
-     */
-    fun fragSubpixel(): String {
+    /** Refino sub-pixel em L1: testa +-0.5 texel em volta do vetor ja filtrado. */
+    fun fragSubpixel(vs: Float): String {
         val win = ArrayList<Pair<Int, Int>>()
         for (j in -1..1) for (i in -1..1) win.add(i to j)
         val sb = StringBuilder()
@@ -231,7 +229,7 @@ in highp vec2 vUv;
 out vec4 o;
 void main() {
   vec4 fv = texelFetch(uFlow, ivec2(gl_FragCoord.xy), 0);
-  highp vec2 base = (fv.rg - 0.5) * 64.0;
+  highp vec2 base = (fv.rg - 0.5) * $vs;
 """
         )
         win.forEachIndexed { k, (i, j) ->
@@ -255,7 +253,7 @@ void main() {
       if (sad < best) { best = sad; bv = base + d; }
     }
   }
-  o = vec4(bv / 64.0 + 0.5, best / 9.0, 1.0);
+  o = vec4(bv / $vs + 0.5, best / 9.0, 1.0);
 }
 """
         )
@@ -267,7 +265,7 @@ void main() {
      * Usa o quadro atual sem deslocar onde: os dois discordam, o custo do
      * movimento e alto, ou o pixel nao mudou entre os quadros (HUD/parado).
      */
-    const val FRAG_MID = """#version 300 es
+    fun fragMid(vs: Float): String = """#version 300 es
 precision highp float;
 precision highp sampler2D;
 uniform sampler2D uCur;
@@ -280,7 +278,7 @@ in vec2 vUv;
 out vec4 o;
 void main() {
     vec3 fl = texture(uFlow, vUv).rgb;
-    vec2 off = (fl.rg - 0.5) * 64.0 * uInvL1;
+    vec2 off = (fl.rg - 0.5) * $vs * uInvL1;
     vec3 a = texture(uCur,  vUv - 0.5 * off).rgb;
     vec3 b = texture(uPrev, vUv + 0.5 * off).rgb;
     vec3 c0 = texture(uCur, vUv).rgb;
@@ -294,9 +292,9 @@ void main() {
 
     /**
      * Extrapolacao (baixa latencia): quadro atual avancado meio passo.
-     * out(y) = atual(y + v/2). Onde a previsao e duvidosa, repete o quadro atual.
+     * Onde a previsao e duvidosa, repete o quadro atual.
      */
-    const val FRAG_EXTRAP = """#version 300 es
+    fun fragExtrap(vs: Float): String = """#version 300 es
 precision highp float;
 precision highp sampler2D;
 uniform sampler2D uCur;
@@ -309,7 +307,7 @@ in vec2 vUv;
 out vec4 o;
 void main() {
     vec3 fl = texture(uFlow, vUv).rgb;
-    vec2 off = (fl.rg - 0.5) * 64.0 * uInvL1;
+    vec2 off = (fl.rg - 0.5) * $vs * uInvL1;
     vec3 c0 = texture(uCur, vUv).rgb;
     vec3 p0 = texture(uPrev, vUv).rgb;
     vec2 q = vUv + 0.5 * off;
