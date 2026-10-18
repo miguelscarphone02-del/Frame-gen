@@ -19,6 +19,7 @@ import android.view.Surface
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Captura o app escolhido (MediaProjection, "um unico app"), gera um quadro
@@ -28,7 +29,8 @@ import kotlin.math.max
  * Modo baixa latencia: mostra o quadro real na hora e, meio intervalo depois,
  * uma previsao do proximo meio passo (extrapolacao).
  *
- * O tamanho da captura segue o tamanho REAL da Surface do overlay.
+ * A busca de movimento usa 4 niveis de piramide (ate 1/32) e vetores em float16
+ * quando a GPU permite, para acompanhar movimentos grandes (camera girando).
  */
 class FrameGenEngine(
     private val cfg: FgConfig,
@@ -77,6 +79,10 @@ class FrameGenEngine(
     private var capH = 0
     private val texMatrix = FloatArray(16)
 
+    // Formato dos vetores de movimento
+    private var halfOk = false
+    private var vs = 64f
+
     // Programas
     private var pOes: Prog? = null
     private var pDown: Prog? = null
@@ -94,7 +100,9 @@ class FrameGenEngine(
     private var l1: Array<Target>? = null
     private var l2: Array<Target>? = null
     private var l3: Array<Target>? = null
-    private var coarse: Target? = null    // movimento em L3
+    private var l4: Array<Target>? = null
+    private var coarse: Target? = null    // movimento em L4
+    private var flow3: Target? = null     // movimento em L3
     private var flow2: Target? = null     // movimento em L2
     private var flowRaw: Target? = null   // movimento em L1 (inteiro)
     private var flowMed: Target? = null   // movimento em L1 (mediano)
@@ -313,15 +321,27 @@ class FrameGenEngine(
     }
 
     private fun initPrograms() {
+        // A GPU aceita desenhar em textura float16? Se sim, vetores de movimento grandes.
+        halfOk = try {
+            GlUtil.createTarget(4, 4, false, true).release()
+            true
+        } catch (t: Throwable) {
+            false
+        }
+        vs = if (halfOk) 256f else 64f
+        // Em 8 bits o vetor maximo e +-32 texels no nivel 1/4: limita o raio.
+        val r = if (halfOk) cfg.radius else min(cfg.radius, 3)
+        Log.i(TAG, "Vetores de movimento: ${if (halfOk) "float16" else "8 bits"} (vs=$vs, raio=$r)")
+
         pOes = Prog(Shaders.VERT, Shaders.FRAG_OES)
         pDown = Prog(Shaders.VERT, Shaders.FRAG_DOWN)
         pDownR = Prog(Shaders.VERT, Shaders.FRAG_DOWN_R)
-        pCoarse = Prog(Shaders.VERT, Shaders.fragCoarse(cfg.radius))
-        pRefine = Prog(Shaders.VERT, Shaders.fragRefine())
+        pCoarse = Prog(Shaders.VERT, Shaders.fragCoarse(r, vs))
+        pRefine = Prog(Shaders.VERT, Shaders.fragRefine(vs))
         pMedian = Prog(Shaders.VERT, Shaders.FRAG_MEDIAN)
-        pSub = Prog(Shaders.VERT, Shaders.fragSubpixel())
-        pMid = Prog(Shaders.VERT, Shaders.FRAG_MID)
-        pExtrap = Prog(Shaders.VERT, Shaders.FRAG_EXTRAP)
+        pSub = Prog(Shaders.VERT, Shaders.fragSubpixel(vs))
+        pMid = Prog(Shaders.VERT, Shaders.fragMid(vs))
+        pExtrap = Prog(Shaders.VERT, Shaders.fragExtrap(vs))
         pPresent = Prog(Shaders.VERT, Shaders.FRAG_PRESENT)
     }
 
@@ -333,16 +353,21 @@ class FrameGenEngine(
         val h2 = (capH + 7) / 8
         val w3 = (capW + 15) / 16
         val h3 = (capH + 15) / 16
+        val w4 = (capW + 31) / 32
+        val h4 = (capH + 31) / 32
         frames = arrayOf(GlUtil.createTarget(capW, capH), GlUtil.createTarget(capW, capH))
         // Luminancia em 1 canal (R8)
         l1 = arrayOf(GlUtil.createTarget(w1, h1, true), GlUtil.createTarget(w1, h1, true))
         l2 = arrayOf(GlUtil.createTarget(w2, h2, true), GlUtil.createTarget(w2, h2, true))
         l3 = arrayOf(GlUtil.createTarget(w3, h3, true), GlUtil.createTarget(w3, h3, true))
-        coarse = GlUtil.createTarget(w3, h3)
-        flow2 = GlUtil.createTarget(w2, h2)
-        flowRaw = GlUtil.createTarget(w1, h1)
-        flowMed = GlUtil.createTarget(w1, h1)
-        fine = GlUtil.createTarget(w1, h1)
+        l4 = arrayOf(GlUtil.createTarget(w4, h4, true), GlUtil.createTarget(w4, h4, true))
+        // Vetores de movimento (float16 quando a GPU permite)
+        coarse = GlUtil.createTarget(w4, h4, false, halfOk)
+        flow3 = GlUtil.createTarget(w3, h3, false, halfOk)
+        flow2 = GlUtil.createTarget(w2, h2, false, halfOk)
+        flowRaw = GlUtil.createTarget(w1, h1, false, halfOk)
+        flowMed = GlUtil.createTarget(w1, h1, false, halfOk)
+        fine = GlUtil.createTarget(w1, h1, false, halfOk)
         mid = GlUtil.createTarget(capW, capH)
         havePrev = false
     }
@@ -352,7 +377,9 @@ class FrameGenEngine(
         l1?.forEach { it.release() }; l1 = null
         l2?.forEach { it.release() }; l2 = null
         l3?.forEach { it.release() }; l3 = null
+        l4?.forEach { it.release() }; l4 = null
         coarse?.release(); coarse = null
+        flow3?.release(); flow3 = null
         flow2?.release(); flow2 = null
         flowRaw?.release(); flowRaw = null
         flowMed?.release(); flowMed = null
@@ -473,6 +500,7 @@ class FrameGenEngine(
         val a = l1 ?: return
         val b = l2 ?: return
         val c = l3 ?: return
+        val d = l4 ?: return
 
         // Quadro RGBA -> L1 (luma, R8)
         p.use()
@@ -482,7 +510,7 @@ class FrameGenEngine(
         p.f2("uOff", 1f / f[i].w, 1f / f[i].h)
         GlUtil.drawQuad()
 
-        // L1 -> L2 -> L3 (R8 -> R8)
+        // L1 -> L2 -> L3 -> L4 (R8 -> R8)
         pr.use()
         pr.i1("uSrc", 0)
         GlUtil.bindTarget(b[i])
@@ -494,6 +522,28 @@ class FrameGenEngine(
         GlUtil.bindTex2D(0, b[i].tex)
         pr.f2("uOff", 0.5f / b[i].w, 0.5f / b[i].h)
         GlUtil.drawQuad()
+
+        GlUtil.bindTarget(d[i])
+        GlUtil.bindTex2D(0, c[i].tex)
+        pr.f2("uOff", 0.5f / c[i].w, 0.5f / c[i].h)
+        GlUtil.drawQuad()
+    }
+
+    /** Um passo de refino: parte do vetor do nivel mais grosso e testa +-1 texel. */
+    private fun refineStep(
+        p: Prog, dst: Target, lv: Array<Target>, cur: Int, prev: Int, coarseT: Target, lambda: Float
+    ) {
+        GlUtil.bindTarget(dst)
+        p.use()
+        GlUtil.bindTex2D(0, lv[cur].tex)
+        GlUtil.bindTex2D(1, lv[prev].tex)
+        GlUtil.bindTex2D(2, coarseT.tex)
+        p.i1("uCur", 0)
+        p.i1("uPrev", 1)
+        p.i1("uCoarse", 2)
+        p.f2("uTexel", 1f / lv[cur].w, 1f / lv[cur].h)
+        p.f1("uLambda", lambda)
+        GlUtil.drawQuad()
     }
 
     private fun runMotion(cur: Int, prev: Int) {
@@ -504,53 +554,38 @@ class FrameGenEngine(
         val a1 = l1 ?: return
         val a2 = l2 ?: return
         val a3 = l3 ?: return
-        val c3 = coarse ?: return
+        val a4 = l4 ?: return
+        val c4 = coarse ?: return
+        val f3 = flow3 ?: return
         val f2 = flow2 ?: return
         val raw = flowRaw ?: return
         val med = flowMed ?: return
         val f1 = fine ?: return
 
-        // 1) Busca grossa em L3 (1/16)
-        GlUtil.bindTarget(c3)
+        // 1) Busca grossa em L4 (1/32): e aqui que o alcance grande e coberto
+        GlUtil.bindTarget(c4)
         pc.use()
-        GlUtil.bindTex2D(0, a3[cur].tex)
-        GlUtil.bindTex2D(1, a3[prev].tex)
+        GlUtil.bindTex2D(0, a4[cur].tex)
+        GlUtil.bindTex2D(1, a4[prev].tex)
         pc.i1("uCur", 0)
         pc.i1("uPrev", 1)
-        pc.f2("uTexel", 1f / a3[cur].w, 1f / a3[cur].h)
+        pc.f2("uTexel", 1f / a4[cur].w, 1f / a4[cur].h)
         pc.f1("uLambda", 0.02f)
         GlUtil.drawQuad()
 
-        // 2) Refino em L2 (1/8)
-        GlUtil.bindTarget(f2)
-        pr.use()
-        GlUtil.bindTex2D(0, a2[cur].tex)
-        GlUtil.bindTex2D(1, a2[prev].tex)
-        GlUtil.bindTex2D(2, c3.tex)
-        pr.i1("uCur", 0)
-        pr.i1("uPrev", 1)
-        pr.i1("uCoarse", 2)
-        pr.f2("uTexel", 1f / a2[cur].w, 1f / a2[cur].h)
-        pr.f1("uLambda", 0.015f)
-        GlUtil.drawQuad()
+        // 2) Refino L3 -> L2 -> L1 (vetores inteiros)
+        refineStep(pr, f3, a3, cur, prev, c4, 0.02f)
+        refineStep(pr, f2, a2, cur, prev, f3, 0.015f)
+        refineStep(pr, raw, a1, cur, prev, f2, 0.015f)
 
-        // 3) Refino em L1 (1/4), vetores inteiros
-        GlUtil.bindTarget(raw)
-        pr.use()
-        GlUtil.bindTex2D(0, a1[cur].tex)
-        GlUtil.bindTex2D(1, a1[prev].tex)
-        GlUtil.bindTex2D(2, f2.tex)
-        pr.f2("uTexel", 1f / a1[cur].w, 1f / a1[cur].h)
-        GlUtil.drawQuad()
-
-        // 4) Filtro mediano 3x3 (remove vetores soltos)
+        // 3) Filtro mediano 3x3 (remove vetores soltos)
         GlUtil.bindTarget(med)
         pm.use()
         GlUtil.bindTex2D(0, raw.tex)
         pm.i1("uFlow", 0)
         GlUtil.drawQuad()
 
-        // 5) Refino sub-pixel (+-0.5 texel) e custo final
+        // 4) Refino sub-pixel (+-0.5 texel) e custo final
         GlUtil.bindTarget(f1)
         ps.use()
         GlUtil.bindTex2D(0, a1[cur].tex)
